@@ -25,14 +25,19 @@ FIFO="$STATE_DIR/mysql.fifo"
 
 log() { echo "pre.sh: $*" >&2; }
 
+completed=0
 rollback() {
   local rc=$?
   trap - EXIT
   exec 3>&-
-  if (( rc != 0 )); then
-    log "failed (exit $rc); undoing completed steps"
-    "$POST_SH" || log "rollback incomplete; check $STATE_DIR"
+  # Success is decided by the flag set on the last line, not by $? alone: a
+  # signal that ends the script (SIGTERM, SIGHUP) runs this trap with $? still 0.
+  if (( rc == 0 && completed )); then
+    exit 0
   fi
+  (( rc != 0 )) || rc=1
+  log "failed (exit $rc); undoing completed steps"
+  "$POST_SH" || log "rollback incomplete; check $STATE_DIR"
   exit "$rc"
 }
 
@@ -74,8 +79,10 @@ if [[ -n $MYSQL ]]; then
   echo "$! $(basename "$MYSQL")" >"$STATE_DIR/mysql.pid"
   setsid sleep "$LOCK_MAX" >&3 2>/dev/null </dev/null 3>&- &
   echo "$! sleep" >"$STATE_DIR/holder.pid"
-  printf "SET SESSION lock_wait_timeout = %d;\nFLUSH TABLES WITH READ LOCK;\nSELECT 'LOCKED';\n" \
-    "$LOCK_WAIT" >&3
+  # wait_timeout: the session sits idle until post.sh, so the server's own idle
+  # timeout (often a few minutes) must not drop the lock before LOCK_MAX does.
+  printf "SET SESSION lock_wait_timeout = %d;\nSET SESSION wait_timeout = %d;\nFLUSH TABLES WITH READ LOCK;\nSELECT 'LOCKED';\n" \
+    "$LOCK_WAIT" "$(( LOCK_MAX + 60 ))" >&3
   exec 3>&-
 
   read -r mysql_pid _ <"$STATE_DIR/mysql.pid"
@@ -111,3 +118,5 @@ if [[ -n $FREEZE_MOUNT ]]; then
   echo "$FREEZE_MOUNT" >"$STATE_DIR/frozen"
   log "froze $FREEZE_MOUNT"
 fi
+
+completed=1
